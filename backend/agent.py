@@ -1,0 +1,742 @@
+
+# Import necessary libraries
+import pandas as pd
+import sqlite3
+import ast
+import os
+import re
+from dotenv import load_dotenv
+from langchain_chroma import Chroma
+from typing import TypedDict, List, Dict, Optional
+from sqlalchemy import create_engine
+
+# uvicorn backend.main:app --reload
+# streamlit run frontend/app.py
+
+# LangChain and LangGraph specific imports
+from langchain_community.agent_toolkits import create_sql_agent
+from langchain_community.utilities import SQLDatabase
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.tools import Tool
+from langchain_community.vectorstores import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+
+from langgraph.graph import StateGraph, END
+import chromadb # Added for client
+
+# Load .env
+load_dotenv()
+
+groq_api_key = os.environ.get("GROQ_API_KEY")
+if not groq_api_key:
+    raise ValueError("GROQ_API_KEY environment variable not set. Please set it before running the app.")
+
+# 2. Database Path (relative to the root 'Project Samarth' folder)
+DB_PATH = "backend/data/samarth.db"
+DB_URL = f"sqlite:///{DB_PATH}"
+# --- END OF CONFIGURATION ---
+
+
+# Define AgentState
+class AgentState(TypedDict):
+    user_query: str
+    rewritten_query: str
+    chat_history: List[Dict]
+    collected_data: List[Dict]
+    planner_decision: Optional[Dict]
+    final_response: Optional[str]
+
+# Identify and extract metadata
+crops_metadata = {
+    "name": "Crop Production Data",
+    "description": "Dataset containing information on crop production across various states, districts, years, seasons, crops, area harvested, and production yield in tonnes.",
+    "source_url": "https://www.data.gov.in/catalog/district-wise-season-wise-crop-production-statistics-0"
+}
+
+rainfall_metadata = {
+    "name": "Rainfall Data",
+    "description": "Dataset containing monthly, seasonal, and annual rainfall data for different subdivisions and years in India.",
+    "source_url": "https://www.data.gov.in/resource/sub-divisional-monthly-rainfall-1901-2017#api"
+}
+
+dataset_metadata = [crops_metadata, rainfall_metadata]
+
+# Set up a vector store (in-memory, will build on app start)
+print("Initializing Vector Store...")
+client = chromadb.Client()
+collection = client.get_or_create_collection(name="dataset_metadata")
+
+# Generate embeddings
+embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+metadata_embeddings = []
+for metadata in dataset_metadata:
+      text_to_embed = f"Name: {metadata['name']}. Description: {metadata['description']}"
+      embedding = embedding_model.embed_query(text_to_embed)
+      metadata_embeddings.append(embedding)
+
+# Add data to the collection
+ids = [f"metadata_{i}" for i in range(len(dataset_metadata))]
+documents = [f"Name: {metadata['name']}. Description: {metadata['description']}" for metadata in dataset_metadata]
+metadatas = dataset_metadata
+try:
+    collection.add(embeddings=metadata_embeddings, documents=documents, metadatas=metadatas, ids=ids)
+    print("Vector Store populated.")
+except chromadb.errors.IDAlreadyExistsError:
+    print("Vector Store already populated.")
+
+
+# Set up the database connection
+print(f"Connecting to database at: {DB_URL}")
+engine = create_engine(DB_URL)
+db = SQLDatabase(engine)
+print(f"Database connection successful. Tables: {db.get_table_names()}")
+
+# Initialize the language model
+llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, groq_api_key=groq_api_key) # llama-3.3-70b-versatile is not a valid model
+
+# Define helper functions for the SQL Chain
+def run_sql_query(query: str):
+    return db.run(query)
+
+def parse_sql_result(result_str: str) -> str:
+    try:
+        data = ast.literal_eval(result_str)
+        if isinstance(data, list) and len(data) == 1 and isinstance(data[0], tuple) and len(data[0]) == 1:
+            return str(data[0][0])
+        if isinstance(data, list) and len(data) == 1 and isinstance(data[0], tuple) and len(data[0]) > 1:
+            return ", ".join([str(item) for item in data[0]])
+        if isinstance(data, list) and all(isinstance(t, tuple) for t in data):
+             clean_tuples = []
+             for t in data:
+                 if len(t) == 1:
+                     clean_tuples.append(f"{t[0]}")
+                 elif len(t) == 2:
+                     clean_tuples.append(f"{t[0]} ({t[1]})")
+             return ", ".join(clean_tuples)
+        return result_str
+    except Exception:
+        return result_str
+
+DB_SCHEMA = """
+CREATE TABLE crop_production (
+  state_name TEXT,
+  district_name TEXT,
+  crop_year INTEGER,
+  season TEXT,
+  crop TEXT,
+  area_hectares REAL,
+  production_tonnes REAL
+)
+
+/*
+3 rows from crop_production table:
+state_name  district_name crop_year season  crop  area_hectares production_tonnes
+Andaman and Nicobar Islands NICOBARS  2000  Kharif  Arecanut  1254.0  2000.0
+Andaman and Nicobar Islands NICOBARS  2000  Kharif  Other Kharif Pulses 2.0 1.0
+Andaman and Nicobar Islands NICOBARS  2000  Kharif  Rice (Paddy)  102.0 321.0
+*/
+
+
+CREATE TABLE rainfall (
+  "SUBDIVISION" TEXT,
+  "YEAR" INTEGER,
+  "JAN" REAL,
+  "FEB" REAL,
+  "MAR" REAL,
+  "APR" REAL,
+  "MAY" REAL,
+  "JUN" REAL,
+  "JUL" REAL,
+  "AUG" REAL,
+  "SEP" REAL,
+  "OCT" REAL,
+  "NOV" REAL,
+  "DEC" REAL,
+  "ANNUAL" REAL,
+  "WINTER" REAL,
+  "PRE_MONSOON" REAL,
+  "MONSOON" REAL,
+  "POST_MONSOON" REAL
+)
+
+/*
+3 rows from rainfall table:
+SUBDIVISION YEAR  JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC ANNUAL  WINTER  PRE_MONSOON MONSOON POST_MONSOON
+Andaman & Nicobar Islands 1997  9.5 0.0 0.2 15.6  281.1 199.5 918.5 430.6 440.2 128.7 292.8 38.4  2755.1  9.5 296.9 1988.8  459.9
+Andaman & Nicobar Islands 1998  0.9   0.0 0.0 0.0 348.9 600.0 364.5 258.9 337.8 618.6 227.8 89.0  2846.4  0.9 348.9   1561.2  935.4
+Andaman & Nicobar Islands 1999  46.8  44.6  14.2  270.6 257.4 295.0 408.5 329.2 325.3 437.5 124.9 145.7 2699.7  91.4  542.2   1358.0  708.1
+*/
+"""
+
+sql_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are a SQLite expert. Given a user question, you must generate a
+            syntactically correct SQLite query to answer it.
+
+            **DB Schema:**
+            {schema}
+
+            **CRITICAL SCHEMA NOTES:**
+            - 'rainfall' table: 'SUBDIVISION' is state, 'ANNUAL' is total rainfall.
+            - 'crop_production' table: 'state_name' is state, 'crop' is crop name, 'production_tonnes' is volume.
+
+            **CRITICAL LOGIC NOTES:**
+            1.  **FOR "LAST N YEARS":**
+                - Use Subqueries such as `WHERE crop_year IN (SELECT DISTINCT crop_year FROM crop_production ORDER BY crop_year DESC LIMIT N)`
+            2.  **FOR "AVERAGE RAINFALL" (by state):**
+                - You MUST use `GROUP BY "SUBDIVISION"`.
+                - **Example:** `SELECT "SUBDIVISION", AVG(ANNUAL) FROM rainfall ... GROUP BY "SUBDIVISION"`
+            3.  **FOR "TOP N CROPS" (by state):**
+                - You MUST `SELECT crop, SUM(production_tonnes)`.
+                - You MUST `GROUP BY crop`.
+                - You MUST `ORDER BY SUM(production_tonnes) DESC`.
+                - **Example:** `SELECT crop, SUM(production_tonnes) AS total_production FROM crop_production ... GROUP BY crop ORDER BY total_production DESC LIMIT 3`
+            4. **FOR "CROP NAME" ERRORS:**
+                 - If you query for a crop by name (e.g., `WHERE crop = 'Rice'`) and get an empty result,
+                   your *first* corrective action MUST be to query the `crop` column
+                   (e.g., `SELECT DISTINCT crop FROM crop_production WHERE crop LIKE '%Rice%'`)
+                   to find the correct database spelling (e.g., 'Rice (Paddy)') and then
+                   re-run your original query with the correct name.
+            5. If I've tried to get all the data, and some of it is missing or sparse, stop looping anyway and just report the data I was able to find.
+            6. When you execute a SQL query, you must only report the exact data returned from the query. If the query returns an empty result, you must state 'No data found' or return an empty string. You are strictly forbidden from inventing, inferring, or hallucinating an answer that is not explicitly present in the database response.
+            7. Pay close attention to the provided schema and example rows. The user may provide a district name, state name, or crop name. You must ensure you query the correct column for the given value (e.g., query district_name for districts, state_name for states).
+
+            **RULES:**
+            - Only output the raw SQL query. Do NOT add markdown, backticks, or any explanation.
+            """
+        ),
+        ("human", "{question}"),
+    ]
+)
+
+sql_chain = (
+    {"question": RunnablePassthrough()}
+    | RunnablePassthrough.assign(schema=lambda x: DB_SCHEMA)
+    | sql_prompt
+    | llm
+    | StrOutputParser()
+    | run_sql_query
+    | parse_sql_result
+)
+
+AGENT_PREFIX = """
+You are a data analyst agent. You are interacting with a SQLite database.
+You are a fallback 'expert' agent. You are only called when the primary, fast tool fails.
+This means the query is likely very complex. Take your time, list the tables,
+check the schema, and build your query step-by-step.
+
+**CRITICAL SCHEMA NOTES:**
+- 'rainfall' table: 'SUBDIVISION' is state, 'ANNUAL' is total rainfall.
+- 'crop_production' table: 'state_name' is state, 'crop' is crop name, 'production_tonnes' is volume.
+
+**CRITICAL LOGIC NOTES:**
+
+1.  **FOR "LAST N YEARS" (Crops):**
+    - `... WHERE crop_year IN (SELECT DISTINCT crop_year FROM crop_production ORDER BY crop_year DESC LIMIT N)`
+
+2.  **FOR "AVERAGE RAINFALL" (by state):**
+    - You MUST use `GROUP BY "SUBDIVISION"`.
+    - **Example:** `SELECT "SUBDIVISION", AVG(ANNUAL) FROM rainfall ... GROUP BY "SUBDIVISION"`
+3.  **FOR "TOP N CROPS" (by state):**
+    - You MUST `SELECT crop, SUM(production_tonnes)`.
+    - You MUST `GROUP BY crop`.
+    - You MUST `ORDER BY SUM(production_tonnes) DESC`.
+    - **Example:** `SELECT crop, SUM(production_tonnes) AS total_production FROM crop_production ... GROUP BY crop ORDER BY total_production DESC LIMIT 3`
+4.  **FOR "CROP NAME" ERRORS:**
+    - If you query for a crop by name (e.g., `WHERE crop = 'Rice'`) and get an empty result,
+      your *first* corrective action MUST be to query the `crop` column
+      (e.g., `SELECT DISTINCT crop FROM crop_production WHERE crop LIKE '%Rice%'`)
+      to find the correct database spelling (e.g., 'Rice (Paddy)') and then
+      re-run your original query with the correct name.
+5. If I've tried to get all the data, and some of it is missing or sparse, stop looping anyway and just report the data I was able to find.
+6. When you execute a SQL query, you must only report the exact data returned from the query. If the query returns an empty result, you must state 'No data found' or return an empty string. You are strictly forbidden from inventing, inferring, or hallucinating an answer that is not explicitly present in the database response.
+7. Pay close attention to the provided schema and example rows. The user may provide a district name, state name, or crop name. You must ensure you query the correct column for the given value (e.g., query district_name for districts, state_name for states).
+**RULES:**
+- FUZZY STRING MATCHING**: All string comparisons in a WHEREclause MUST be case-insensitive and flexible. ALWAYS useLOWER()and theLIKE operator with wildcards (%). Example: WHERE LOWER(district_name) LIKE '%nicobar%'orWHERE LOWER(state_name) LIKE '%bihar%'
+- AGGREGATE VAGUE QUERIES**: For general questions (e.g., "what is crop production"), DO NOT `SELECT *`. Default to providing the TOP 10 crops by total production: `SELECT crop, SUM(production_tonnes) ... GROUP BY crop ORDER BY SUM(production_tonnes) DESC LIMIT 10`.
+- You have access to tools for interacting with the database.
+- You must follow the "Thought, Action, Observation" format.
+- After you have the final answer, respond *only* with "Final Answer: [your_answer]".
+"""
+
+sql_agent_executor = create_sql_agent(
+    llm=llm,
+    db=db,
+    agent_type="openai-tools",
+    verbose=True,
+    prefix=AGENT_PREFIX,
+    handle_parsing_errors=True
+)
+
+
+
+# Master SQL
+
+#
+# REPLACE YOUR CURRENT FUNCTION WITH THIS ENTIRE BLOCK
+#
+def master_sql_executor(question: str) -> str:
+    print(f"---SQL MASTER EXECUTOR: Running fast chain for: {question}---")
+    try:
+        result = sql_chain.invoke(question)
+
+        # --- THIS IS THE CRITICAL LINE THAT IS MISSING/WRONG IN YOUR CODE ---
+        if not result or result == "No data found.":
+        # -----------------------------------------------------------------
+            raise ValueError("Fast chain returned an empty/None result, escalating to smart agent.")
+        
+        print("---SQL MASTER EXECUTOR: Fast chain success.---")
+        return result
+    except (ValueError, sqlite3.OperationalError, Exception) as e:
+        # This code will NOW run because the 'if' statement will catch 'None'
+        print(f"---SQL MASTER EXECUTOR: Fast chain failed ({e}). Escalating to smart agent.---")
+        agent_result = sql_agent_executor.invoke({"input": question})
+        return agent_result['output']
+
+wrapped_embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+retriever = Chroma(
+    client=client,
+    collection_name="dataset_metadata",
+    embedding_function=wrapped_embedding_model,
+).as_retriever()
+
+rag_prompt = ChatPromptTemplate.from_template("""Answer the question based only on the following context:
+{context}
+
+Question: {question}
+""")
+
+rag_chain = (
+    {"context": retriever, "question": RunnablePassthrough()}
+    | rag_prompt
+    | llm
+    | StrOutputParser()
+)
+
+sql_agent_tool = Tool(
+    name="SQL_Agent",
+    func=master_sql_executor,
+    description="A tool that can answer quantitative questions by querying the samarth.db database. Use this tool for all questions requiring database lookups, aggregations, or filtering. Input should be the user's question about the data."
+)
+
+rag_agent_tool = Tool(
+    name="RAG_Agent",
+    func=rag_chain.invoke,
+    description="A tool that can answer questions based on retrieved dataset metadata from the vector store. Use this tool for questions about the datasets themselves, such as their names, descriptions, or source URLs. Input should be the user's question about the dataset metadata."
+)
+
+tools_dict = {
+    "SQL_Agent": sql_agent_tool,
+    "RAG_Agent": rag_agent_tool,
+}
+
+def get_db_crop_synonyms(potential_names: list[str], db_conn) -> dict:
+    if not potential_names:
+        return {}
+    like_clauses = " OR ".join([f"crop LIKE '%{name}%'" for name in potential_names])
+    query = f"SELECT DISTINCT crop FROM crop_production WHERE {like_clauses}"
+    try:
+        result_str = db_conn.run(query)
+        result_list = ast.literal_eval(result_str)
+        mapping = {}
+        for user_name in potential_names:
+            for (db_name,) in result_list:
+                if user_name.lower() in db_name.lower():
+                    mapping[user_name] = db_name
+                    break
+            if user_name not in mapping:
+                mapping[user_name] = user_name
+        return mapping
+    except Exception:
+        return {name: name for name in potential_names}
+
+def get_db_district_synonyms(potential_names: list[str], db_conn) -> dict:
+    if not potential_names:
+        return {}
+    
+    # Query for district_name in crop_production
+    like_clauses = " OR ".join([f"LOWER(district_name) LIKE '%{name.lower()}%'" for name in potential_names])
+    query = f"SELECT DISTINCT district_name FROM crop_production WHERE {like_clauses}"
+    
+    try:
+        result_str = db_conn.run(query)
+        result_list = ast.literal_eval(result_str)
+        
+        mapping = {}
+        for user_name in potential_names:
+            user_name_lower = user_name.lower()
+            
+            for (db_name,) in result_list: # Unpack the tuple
+                if user_name_lower in db_name.lower():
+                    mapping[user_name] = db_name
+                    break  # Found a match, move to the next user_name
+            
+            if user_name not in mapping:
+                mapping[user_name] = user_name # Default to original name
+        
+        return mapping
+    except Exception:
+        # Fail safe: return original names
+        return {name: name for name in potential_names}
+
+def get_db_state_synonyms(potential_names: list[str], db_conn) -> dict:
+    if not potential_names:
+        return {}
+    
+    all_db_states = set()
+    
+    # 1. Query crop_production for state_name
+    try:
+        like_clauses_crop = " OR ".join([f"LOWER(state_name) LIKE '%{name.lower()}%'" for name in potential_names])
+        query_crop = f"SELECT DISTINCT state_name FROM crop_production WHERE {like_clauses_crop}"
+        result_str_crop = db_conn.run(query_crop)
+        result_list_crop = ast.literal_eval(result_str_crop)
+        for (state,) in result_list_crop:
+            all_db_states.add(state)
+    except Exception:
+        pass # Ignore errors if one table fails
+
+    # 2. Query rainfall for "SUBDIVISION"
+    try:
+        like_clauses_rain = " OR ".join([f"LOWER(\"SUBDIVISION\") LIKE '%{name.lower()}%'" for name in potential_names])
+        query_rain = f"SELECT DISTINCT \"SUBDIVISION\" FROM rainfall WHERE {like_clauses_rain}"
+        result_str_rain = db_conn.run(query_rain)
+        result_list_rain = ast.literal_eval(result_str_rain)
+        for (subdivision,) in result_list_rain:
+            all_db_states.add(subdivision)
+    except Exception:
+        pass # Ignore errors if one table fails
+
+    # 3. Create the mapping
+    mapping = {}
+    for user_name in potential_names:
+        user_name_lower = user_name.lower()
+        
+        for db_name in all_db_states:
+            if user_name_lower in db_name.lower():
+                mapping[user_name] = db_name
+                break
+        
+        if user_name not in mapping:
+            mapping[user_name] = user_name
+            
+    return mapping
+
+QUERY_REWRITER_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are a query-rewriting assistant. Your *only* job is to
+            take a 'Follow-up question' and 'Relevant Chat History' and
+            rephrase the follow-up question into a clear, standalone question.
+
+            **CRITICAL RULES:**
+            1.  **DO NOT** answer the question yourself.
+            2.  **DO NOT** add any new information.
+            3.  If the 'Follow-up question' is already standalone, just return it exactly as-is.
+            4.  Your output MUST be *only* the rewritten, standalone question.
+
+            **Relevant Chat History:**
+            {chat_history}
+            """,
+        ),
+        ("human", "Follow-up question: {question}"),
+    ]
+)
+query_rewriter_chain = QUERY_REWRITER_PROMPT | llm | StrOutputParser()
+
+def rewrite_query(state: AgentState):
+    print("---NODE: rewrite_query---")
+    user_query = state["user_query"]
+    chat_history = state["chat_history"]
+    if not chat_history:
+        print("---REWRITER: No history, returning original query.---")
+        return {"rewritten_query": user_query}
+    try:
+        history_texts = []
+        for msg in chat_history:
+            if msg.get('role') in ['user', 'assistant']:
+                history_texts.append(f"{msg['role']}: {msg['content']}")
+        
+        if not history_texts:
+             print("---REWRITER: No relevant history, returning original query.---")
+             return {"rewritten_query": user_query}
+        
+        # Using a simple last-k history for relevance instead of a vector store,
+        # as the vector store setup in a node is complex and this is more robust
+        # for a stateless server environment.
+        formatted_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-10:]])
+
+    except Exception as e:
+        print(f"---REWRITER: Error formatting history ({e}). Using last 10.---")
+        formatted_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-10:]])
+
+    rewritten_query = query_rewriter_chain.invoke({"chat_history": formatted_history, "question": user_query})
+    print(f"---REWRITER: Original: '{user_query}' -> Rewritten: '{rewritten_query}'---")
+    return {"rewritten_query": rewritten_query}
+
+orchestrator_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are an expert orchestrator for a data analysis chatbot.
+            Your job is to break down a complex user query into a step-by-step plan.
+            You will be given the user's query, chat history, and a list of data that has already been collected.
+
+            You have two tools available:
+            1.  **SQL_Agent**: Use this for **quantitative questions** about the data. (e.g., "What is the average rainfall...", "List the top 3 crops...", "What are the last 5 available years?")
+            2.  **RAG_Agent**: Use this *only* for **metadata questions**. (e.g., "What is the source URL...", "Describe the rainfall dataset.")
+
+            **CRITICAL RULE 1: CHOOSE THE RIGHT TOOL.**
+            - Any question that asks for *values, numbers, lists, or dates* from the database (like "What is..." or "How many...") MUST go to the `SQL_Agent`.
+            - Any question about *dataset sources or descriptions* MUST go to the `RAG_Agent`.
+            - **DO NOT** ask the `RAG_Agent` a quantitative question. It will fail, and you must not try again.
+
+            **CRITICAL RULE 2: CHECK COLLECTED DATA.**
+            - Before you call a tool, review the `collected_data` list. If the information you
+              need (based on the 'question_asked' and 'answer_received') is *already* in the list,
+              **do not call the tool again**. Move on to the next step.
+
+            **CRITICAL RULE 3: HANDLE IMPOSSIBLE TASKS.**
+            - If a tool tells you data is unavailable (e.g., "data for 2024 does not exist"),
+              **stop trying to get it**. Acknowledge this limitation and move to `SYNTHESIZE`.
+
+            **CRITICAL RULE 4: ONE THING AT A TIME.**
+            - Ask for one piece of information at a time (e.g., rainfall for one state).
+
+            **CRITICAL RULE 5: RAG TOOL USAGE.**
+              - The RAG_Agent only knows about *general* dataset metadata.
+              - **DO NOT** ask it for specific regions (like 'Bihar' or 'Andaman').
+              - **ALWAYS** ask general questions like: "What is the source for all rainfall data?"
+
+            Respond with a JSON object with your decision:
+            {{
+                "decision": "CALL_TOOL" or "SYNTHESIZE",
+                "tool_name": "SQL_Agent" or "RAG_Agent" (if calling tool),
+                "tool_input": "The specific, single question." (if calling tool),
+                "reasoning": "Your brief thought process for this *single* step."
+            }}
+
+            **Example of correct tool selection:**
+            User Query: "What was the rainfall in 2009 and what is the source?"
+            Collected Data: []
+            Your JSON Output:
+            {{
+                "decision": "CALL_TOOL",
+                "tool_name": "SQL_Agent",
+                "tool_input": "What was the annual rainfall in 2009?",
+                "reasoning": "First, I must use the SQL_Agent to get the quantitative rainfall value."
+            }}
+
+            **After that tool call:**
+            Collected Data: [{{"tool_called": "SQL_Agent", "question_asked": "What was the annual rainfall in 2009?", "answer_received": "2538.6"}}]
+            Your JSON Output:
+            {{
+                "decision": "CALL_TOOL",
+                "tool_name": "RAG_Agent",
+                "tool_input": "What is the source for the rainfall data?",
+                "reasoning": "I have the rainfall value (2538.6). Now I will use the RAG_Agent to get the metadata (source)."
+            }}
+            """
+        ),
+        ("human", "User Query: {user_query}\nChat History: {chat_history}\n\nCollected Data: {collected_data}"),
+    ]
+)
+orchestrator_chain = orchestrator_prompt | llm | JsonOutputParser()
+
+def plan_workflow(state: AgentState):
+    print("---NODE: plan_workflow---")
+    prompt_input = {
+        "user_query": state['rewritten_query'],
+        "chat_history": state['chat_history'],
+        "collected_data": state['collected_data']
+    }
+    try:
+        response = orchestrator_chain.invoke(prompt_input)
+    except Exception as e:
+        print(f"---PLANNER: Error, escalating to SYNTHESIZE. {e}---")
+        response = {"decision": "SYNTHESIZE", "tool_name": None, "tool_input": None, "reasoning": "Faced an error during planning, attempting to synthesize a response."}
+    print(f"---PLANNER: Decision: {response}---")
+    return {"planner_decision": response}
+
+extractor_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are an expert at extracting entities. Given a user's question,
+            extract all crop names, state names, and district names mentioned.
+
+            Respond *only* with a JSON object. If no entity is found, return an empty list for that key.
+            
+            Example 1:
+            Question: "What is the production of Urad and Turmeric in Bihar?"
+            Response:
+            {
+                "crops": ["Urad", "Turmeric"],
+                "states": ["Bihar"],
+                "districts": []
+            }
+
+            Example 2:
+            Question: "Compare Rice (Paddy) to Sugarcane in Nicobar district."
+            Response:
+            {
+                "crops": ["Rice (Paddy)", "Sugarcane"],
+                "states": [],
+                "districts": ["Nicobar"]
+            }
+
+            Example 3:
+            Question: "What was the rainfall in 2010?"
+            Response:
+            {
+                "crops": [],
+                "states": [],
+                "districts": []
+            }
+            """
+        ),
+        ("human", "Question: {question}"),
+    ]
+)
+crop_extractor_chain = extractor_prompt | llm | JsonOutputParser()
+
+def correct_sql_input(state: AgentState):
+    print("---NODE: correct_sql_input---")
+    planner_decision = state["planner_decision"]
+    original_tool_input = planner_decision["tool_input"]
+    
+    try:
+        # 1. Extract all entities
+        entities = crop_extractor_chain.invoke({"question": original_tool_input})
+        potential_crops = entities.get("crops", [])
+        potential_states = entities.get("states", [])
+        potential_districts = entities.get("districts", [])
+    except Exception:
+        print("---ENTITY EXTRACTOR: Failed to parse entities. Skipping correction.---")
+        return # No change, proceed to execute_tool
+    
+    # 2. Find synonyms for all entities
+    crop_synonyms = get_db_crop_synonyms(potential_crops, db)
+    state_synonyms = get_db_state_synonyms(potential_states, db)
+    district_synonyms = get_db_district_synonyms(potential_districts, db)
+    
+    # 3. Combine all synonym maps
+    all_synonyms = {**crop_synonyms, **state_synonyms, **district_synonyms}
+    
+    # 4. Replace entities in the original query
+    corrected_tool_input = original_tool_input
+    for user_name, db_name in all_synonyms.items():
+        if user_name != db_name:
+            # Use a case-insensitive replace
+            corrected_tool_input = re.sub(re.escape(user_name), db_name, corrected_tool_input, flags=re.IGNORECASE)
+            print(f"---NAME CORRECTOR: Replaced '{user_name}' with '{db_name}'---")
+
+    planner_decision["tool_input"] = corrected_tool_input
+    return {"planner_decision": planner_decision}
+
+
+def execute_tool(state: AgentState):
+    print("---NODE: execute_tool---")
+    decision = state["planner_decision"]
+    tool_name = decision["tool_name"]
+    tool_input = decision["tool_input"]
+    
+    print(f"---TOOL EXECUTOR: Calling {tool_name} with input: {tool_input}---")
+    tool_to_run = tools_dict[tool_name]
+    result = tool_to_run.invoke(tool_input)
+    print(f"---TOOL EXECUTOR: Result: {result}---")
+
+    structured_data_point = {"tool_called": tool_name, "question_asked": tool_input, "answer_received": result}
+    new_data_list = state["collected_data"] + [structured_data_point]
+    return {"collected_data": new_data_list}
+
+def route_from_planner(state: AgentState):
+    print("---NODE: route_from_planner---")
+    decision = state["planner_decision"]["decision"]
+    
+    if decision == "SYNTHESIZE":
+        print("---ROUTER: -> synthesize_answer---")
+        return "synthesize_answer"
+    
+    if decision == "CALL_TOOL":
+        tool_name = state["planner_decision"]["tool_name"]
+        if tool_name == "SQL_Agent":
+            print("---ROUTER: -> correct_sql_input---")
+            return "correct_sql_input"
+        else:
+            print("---ROUTER: -> execute_tool---")
+            return "execute_tool"
+            
+    print("---ROUTER: Defaulting -> synthesize_answer---")
+    return "synthesize_answer"
+
+synthesizer_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are a helpful assistant. Your job is to give a final, direct answer to the user.
+
+            **Rules:**
+            1.  Focus *only* on the user's most recent query: **{user_query}**
+            2.  Use the "All Collected Data" to find the answer. Do not mention the data collection process.
+            3.  Use the "Chat History" *only* to understand context (like "that state" or "it"), but **DO NOT** re-summarize the history in your answer.
+            4.  Be brief but also detailed (if necessary), natural, and conversational.
+            5.  Cite your sources if the RAG agent provided them.
+            6.  Acknowledge failures if data was unavailable.
+
+            **Chat History (for context only):**
+            {chat_history}
+
+            **All Collected Data (to answer the query):**
+            {collected_data}
+
+            Generate the final, direct answer.
+            """
+        ),
+    ]
+)
+synthesizer_chain = synthesizer_prompt | llm | StrOutputParser()
+
+def synthesize_answer(state: AgentState):
+    print("---NODE: synthesize_answer---")
+    formatted_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in state["chat_history"]])
+    prompt_input = {"user_query": state['rewritten_query'], "chat_history": formatted_history, "collected_data": state['collected_data']}
+    try:
+        final_response = synthesizer_chain.invoke(prompt_input)
+    except Exception as e:
+        print(f"---SYNTHESIZER: Error: {e}---")
+        final_response = "Sorry, I ran into an error while generating the final answer."
+    
+    print(f"---SYNTHESIZER: Final Response: {final_response}---")
+    return {"final_response": final_response}
+
+# --- Build and Compile the Graph ---
+print("Compiling LangGraph workflow...")
+workflow = StateGraph(AgentState)
+workflow.add_node("rewrite_query", rewrite_query)
+workflow.add_node("plan_workflow", plan_workflow)
+workflow.add_node("correct_sql_input", correct_sql_input)
+workflow.add_node("execute_tool", execute_tool)
+workflow.add_node("synthesize_answer", synthesize_answer)
+
+workflow.set_entry_point("rewrite_query")
+workflow.add_edge("rewrite_query", "plan_workflow")
+workflow.add_conditional_edges("plan_workflow", route_from_planner, {
+    "synthesize_answer": "synthesize_answer",
+    "correct_sql_input": "correct_sql_input",
+    "execute_tool": "execute_tool"
+})
+workflow.add_edge("correct_sql_input", "execute_tool")
+workflow.add_edge("execute_tool", "plan_workflow") # Loop back to planner
+workflow.add_edge("synthesize_answer", END)
+
+# This is the final, compiled app that main.py will import
+agent_app = workflow.compile()
+print("LangGraph workflow compiled successfully. Ready to serve.")

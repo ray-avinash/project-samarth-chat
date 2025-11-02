@@ -5,7 +5,7 @@ import requests
 import json
 
 # --- Backend Configuration ---
-FASTAPI_URL = "http://127.0.0.1:8000/chat"
+FASTAPI_URL = "https://samarth-backend-q48e.onrender.com"
 
 # --- Streamlit Page Setup ---
 st.set_page_config(page_title="Project Samarth", page_icon="🌾")

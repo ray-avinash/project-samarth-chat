@@ -28,10 +28,21 @@ groq_api_key = os.environ.get("GROQ_API_KEY")
 if not groq_api_key:
     raise ValueError("GROQ_API_KEY environment variable not set. Please set it before running the app.")
 
-DB_PATH = "backend/data/samarth.db"
-DB_URL = f"sqlite:///{DB_PATH}"
-# --- END OF CONFIGURATION ---
 
+# --- DATABASE CONFIGURATION --
+# Get the database URL from Railway's environment variables
+DATABASE_URL = os.environ.get("DATABASE_URL") 
+
+# This fix is needed for SQLAlchemy to work with Railway's URL
+if DATABASE_URL and DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+print("Connecting to production database...")
+engine = create_engine(DATABASE_URL)
+db = SQLDatabase(engine)
+
+# Use the new (non-deprecated) function to get table names
+print(f"Database connection successful. Tables: {db.get_usable_table_names()}")
 
 # Define AgentState
 class AgentState(TypedDict):
@@ -42,16 +53,6 @@ class AgentState(TypedDict):
     planner_decision: Optional[Dict]
     final_response: Optional[str]
 
-# --- RAG / VECTOR STORE HAS BEEN REMOVED ---
-print("---")
-print("--- RUNNING IN SLIM-BUT-SMART MODE (SQL + Hardcoded Sources) ---")
-print("---")
-
-# Set up the database connection
-print(f"Connecting to database at: {DB_URL}")
-engine = create_engine(DB_URL)
-db = SQLDatabase(engine)
-print(f"Database connection successful. Tables: {db.get_table_names()}")
 
 # Initialize the language model
 llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, groq_api_key=groq_api_key)

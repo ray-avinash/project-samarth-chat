@@ -30,7 +30,6 @@ if not groq_api_key:
 
 
 # --- DATABASE CONFIGURATION --
-# Get the database URL from Railway's environment variables
 DATABASE_URL = os.environ.get("DATABASE_URL") 
 
 # This fix is needed for SQLAlchemy to work with Railway's URL
@@ -39,10 +38,18 @@ if DATABASE_URL and DATABASE_URL.startswith("postgresql://"):
 
 print("Connecting to production database...")
 engine = create_engine(DATABASE_URL)
-db = SQLDatabase(engine, sample_rows_in_table_info=0)
+
+# Define exactly which tables the agent can access
+include_these_tables = ['crop_production', 'rainfall']
+
+db = SQLDatabase(
+    engine,
+    include_tables=include_these_tables,
+    sample_rows_in_table_info=0  # Keep the previous fix too
+)
 
 # Use the new (non-deprecated) function to get table names
-print(f"Database connection successful. Tables: {db.get_usable_table_names()}")
+print(f"Database connection successful. Agent is restricted to tables: {db.get_usable_table_names()}")
 
 # Define AgentState
 class AgentState(TypedDict):

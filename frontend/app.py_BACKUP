@@ -5,9 +5,7 @@ import requests
 import json
 
 # --- Backend Configuration ---
-# 1.  CHANGED: This now points to your new, live Railway URL.
-#     (You will get this from the "Settings" -> "Networking" tab on Railway)
-FASTAPI_URL = "https://project-samarth-chat-production.up.railway.app" # <-- Make sure this is your correct URL
+FASTAPI_URL = "https://samarth-backend-q48e.onrender.com"
 
 # --- Streamlit Page Setup ---
 st.set_page_config(page_title="Project Samarth", page_icon="🌾")
@@ -48,11 +46,8 @@ if prompt := st.chat_input("What would you like to know?"):
                 "chat_history": history_for_backend 
             }
             
-            # 2.  CHANGED: This now points to the correct "/chat" endpoint
-            API_ENDPOINT = f"{FASTAPI_URL}/chat"
-            
             # Make the POST request to the FastAPI backend
-            response = requests.post(API_ENDPOINT, json=payload, timeout=120) # 120-second timeout for complex agents
+            response = requests.post(FASTAPI_URL, json=payload, timeout=120) # 120-second timeout for complex agents
             
             # Check for a successful response
             if response.status_code == 200:

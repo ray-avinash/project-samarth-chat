@@ -1,24 +1,26 @@
+# File: requirements.txt
 
+# --- Server ---
 fastapi
 uvicorn
+gunicorn
 
+# --- Frontend ---
 streamlit
 requests
 
+# --- LangChain Core ---
 langchain
 langgraph
 pydantic
 
+# --- LLMs & DBs ---
 langchain-groq
 langchain-openai
-langchain-huggingface
-sentence-transformers
-
 langchain-community
-langchain-chroma
-chromadb
 sqlalchemy
 
+# --- Utilities ---
 pandas
 python-dotenv
-gunicorn
+psycopg2-binary

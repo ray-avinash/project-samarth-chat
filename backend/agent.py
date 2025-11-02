@@ -39,7 +39,7 @@ if DATABASE_URL and DATABASE_URL.startswith("postgresql://"):
 
 print("Connecting to production database...")
 engine = create_engine(DATABASE_URL)
-db = SQLDatabase(engine)
+db = SQLDatabase(engine, sample_rows_in_table_info=0)
 
 # Use the new (non-deprecated) function to get table names
 print(f"Database connection successful. Tables: {db.get_usable_table_names()}")

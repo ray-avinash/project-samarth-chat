@@ -10,6 +10,7 @@ from langchain_chroma import Chroma
 from typing import TypedDict, List, Dict, Optional
 from sqlalchemy import create_engine
 
+# .\.venv\Scripts\Activate.ps1
 # uvicorn backend.main:app --reload
 # streamlit run frontend/app.py
 
@@ -681,15 +682,16 @@ synthesizer_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            """You are a helpful assistant. Your job is to give a final, direct answer to the user.
+            """You are a helpful assistant. Your job is to give a final, objective answer to the user's query based *only* on the data.
 
             **Rules:**
             1.  Focus *only* on the user's most recent query: **{user_query}**
             2.  Use the "All Collected Data" to find the answer. Do not mention the data collection process.
-            3.  Use the "Chat History" *only* to understand context (like "that state" or "it"), but **DO NOT** re-summarize the history in your answer.
-            4.  Be brief but also detailed (if necessary), natural, and conversational.
-            5.  Cite your sources if the RAG agent provided them.
-            6.  Acknowledge failures if data was unavailable.
+            3.  **DO NOT HALLUCINATE.** If the data contradicts the user's premise (e.g., they want to "support" a policy but the data is negative), you MUST present the data objectively as-is. It is your job to be truthful to the data.
+            4.  Be brief, natural, and conversational.
+            5. Use the "Chat History" *only* to understand context (like "that state" or "it"), but **DO NOT** re-summarize the history in your answer.
+            6. Cite your sources if the RAG agent provided them.
+            7.  Acknowledge failures if data was unavailable.
 
             **Chat History (for context only):**
             {chat_history}
@@ -697,11 +699,12 @@ synthesizer_prompt = ChatPromptTemplate.from_messages(
             **All Collected Data (to answer the query):**
             {collected_data}
 
-            Generate the final, direct answer.
+            Generate the final, direct, and data-backed answer.
             """
         ),
     ]
 )
+
 synthesizer_chain = synthesizer_prompt | llm | StrOutputParser()
 
 def synthesize_answer(state: AgentState):

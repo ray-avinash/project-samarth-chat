@@ -4,7 +4,7 @@ import streamlit as st
 import requests
 import json
 
-# --- Backend Configuration ---
+# --- Backend Configuration --
 FASTAPI_URL = "https://samarth-backend-q48e.onrender.com"
 
 # --- Streamlit Page Setup ---
